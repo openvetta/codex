@@ -1,0 +1,152 @@
+name: vetta-windows-sandbox
+
+on:
+  push:
+    branches:
+      - vetta/windows-sandbox
+    tags:
+      - "vetta-sandbox-v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vetta-windows-sandbox-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  build:
+    name: Build Windows sandbox (x64)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: codex-rs
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - uses: dtolnay/rust-toolchain@a0b273b48ed29de4470960879e8381ff45632f26 # 1.93.0
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Test sandbox crate
+        run: cargo test --locked -p codex-windows-sandbox
+
+      - name: Build release binaries
+        run: cargo build --locked -p codex-windows-sandbox --bins --release --target x86_64-pc-windows-msvc
+
+      - name: Verify and package Vetta sandbox
+        id: package
+        shell: pwsh
+        env:
+          VETTA_SANDBOX_TARGET: x86_64-pc-windows-msvc
+        run: |
+          $ErrorActionPreference = "Stop"
+          $releaseDir = Join-Path $PWD "target/$env:VETTA_SANDBOX_TARGET/release"
+          $stageDir = Join-Path $env:RUNNER_TEMP "vetta-windows-sandbox"
+          $archiveName = "vetta-windows-sandbox-$env:VETTA_SANDBOX_TARGET.zip"
+          $archivePath = Join-Path $env:RUNNER_TEMP $archiveName
+          $checksumPath = "$archivePath.sha256"
+          $binaryNames = @(
+            "codex-windows-sandbox-host.exe",
+            "codex-windows-sandbox-setup.exe",
+            "codex-command-runner.exe"
+          )
+
+          New-Item -ItemType Directory -Path $stageDir -Force | Out-Null
+          foreach ($binaryName in $binaryNames) {
+            $binaryPath = Join-Path $releaseDir $binaryName
+            if (-not (Test-Path -LiteralPath $binaryPath -PathType Leaf)) {
+              throw "Required sandbox binary is missing: $binaryPath"
+            }
+            Copy-Item -LiteralPath $binaryPath -Destination (Join-Path $stageDir $binaryName)
+          }
+
+          $hostPath = Join-Path $stageDir "codex-windows-sandbox-host.exe"
+          $capabilitiesJson = & $hostPath --capabilities --json
+          if ($LASTEXITCODE -ne 0) {
+            throw "Sandbox host capability probe failed with exit code $LASTEXITCODE"
+          }
+          $capabilities = $capabilitiesJson | ConvertFrom-Json
+          foreach ($requiredCapability in @(
+            "fullSandbox",
+            "explicitRoots",
+            "denyRead",
+            "denyWrite",
+            "tempRoot",
+            "networkIsolation",
+            "jobObjectKillTree",
+            "clearEnv"
+          )) {
+            if ($capabilities.$requiredCapability -ne $true) {
+              throw "Sandbox host did not report required capability: $requiredCapability"
+            }
+          }
+
+          $binaryManifest = foreach ($binaryName in $binaryNames) {
+            $binaryPath = Join-Path $stageDir $binaryName
+            $binary = Get-Item -LiteralPath $binaryPath
+            [ordered]@{
+              name = $binaryName
+              bytes = $binary.Length
+              sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $binaryPath).Hash.ToLowerInvariant()
+            }
+          }
+          $manifest = [ordered]@{
+            schemaVersion = 1
+            repository = $env:GITHUB_REPOSITORY
+            commit = $env:GITHUB_SHA
+            target = $env:VETTA_SANDBOX_TARGET
+            capabilities = $capabilities
+            binaries = $binaryManifest
+          }
+          $manifest | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $stageDir "manifest.json") -Encoding utf8
+
+          Compress-Archive -Path (Join-Path $stageDir "*") -DestinationPath $archivePath -CompressionLevel Optimal
+          $archiveHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $archivePath).Hash.ToLowerInvariant()
+          "$archiveHash  $archiveName" | Set-Content -LiteralPath $checksumPath -Encoding ascii
+
+          "archive-path=$archivePath" >> $env:GITHUB_OUTPUT
+          "checksum-path=$checksumPath" >> $env:GITHUB_OUTPUT
+
+      - name: Upload Windows sandbox artifact
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        with:
+          name: vetta-windows-sandbox-x86_64-pc-windows-msvc
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+          path: |
+            ${{ steps.package.outputs.archive-path }}
+            ${{ steps.package.outputs.checksum-path }}
+
+  release:
+    name: Publish tagged sandbox artifact
+    if: startsWith(github.ref, 'refs/tags/vetta-sandbox-v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download Windows sandbox artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: vetta-windows-sandbox-x86_64-pc-windows-msvc
+          path: dist
+
+      - name: Publish sandbox release
+        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2
+        with:
+          files: |
+            dist/vetta-windows-sandbox-x86_64-pc-windows-msvc.zip
+            dist/vetta-windows-sandbox-x86_64-pc-windows-msvc.zip.sha256
+          fail_on_unmatched_files: true
+          generate_release_notes: false
+          body: |
+            Windows x64 sandbox binaries for Vetta.
+
+            The ZIP contains `codex-windows-sandbox-host.exe`,
+            `codex-windows-sandbox-setup.exe`, `codex-command-runner.exe`, and
+            a manifest with the source commit and per-binary SHA256 hashes.
